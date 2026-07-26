@@ -17,6 +17,8 @@ second chatbot, phrase router, polling relay, or alternate persona.
    skill into the selected Hermes home. Supply `--gateway-python` to fetch the
    pinned frogcot/froggeolib releases, or also supply `--frogcot` and
    `--froggeolib` to install live checkouts in editable mode.
+3. For local development, add `--link`. Treat this repository as the sole
+   source of truth and never edit the linked paths under `~/.hermes`.
 4. Add the configuration and authorization values described in the reference.
    Keep certificates, database URIs, user IDs, and coordinates out of the repo.
 5. Restart the Hermes gateway once and verify one persistent mutual-TLS ATAK
@@ -56,6 +58,8 @@ the adapter, identity, marker reconciliation, or spatial calculations.
 ## Maintain
 
 - Edit the reusable source under `plugin/`, then install it into Hermes.
+- In linked development mode, edit only this repository. Skill updates become
+  visible on the next skill load; restart the gateway after plugin changes.
 - Release and push frogcot/froggeolib version tags before publishing an
   integration release that fetches them.
 - Keep `plugin/adapter.py` free of response generation and phrase-specific
@@ -71,7 +75,7 @@ the adapter, identity, marker reconciliation, or spatial calculations.
 
 - `plugin/`: Hermes ATAK platform plugin and OTS snapshot helper.
 - `scripts/install.py`: deterministic file installer; it does not edit secrets
-  or live configuration.
+  or live configuration and supports copy or symlink mode.
 - `references/configuration.md`: portable installation and configuration.
 - `references/architecture.md`: data flow and design boundaries.
 - `references/operations.md`: live verification and troubleshooting.

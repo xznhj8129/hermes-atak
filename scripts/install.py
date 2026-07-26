@@ -27,6 +27,23 @@ def copy_file(source: Path, destination: Path, *, dry_run: bool) -> None:
     shutil.copy2(source, destination)
 
 
+def link_directory(source: Path, destination: Path, *, dry_run: bool) -> None:
+    print(f"{destination} -> {source}")
+    if destination.is_symlink():
+        if destination.resolve() == source.resolve():
+            return
+        raise SystemExit(f"refusing to replace existing symlink: {destination}")
+    if destination.exists():
+        raise SystemExit(
+            f"refusing to replace existing path: {destination}\n"
+            "Move it aside first, then run the installer again."
+        )
+    if dry_run:
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.symlink_to(source.resolve(), target_is_directory=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Install the Hermes ATAK plugin and operational skill."
@@ -41,6 +58,11 @@ def main() -> int:
         "--dry-run",
         action="store_true",
         help="Print destination paths without writing files.",
+    )
+    parser.add_argument(
+        "--link",
+        action="store_true",
+        help="Symlink Hermes directly to this repository instead of copying files.",
     )
     parser.add_argument(
         "--gateway-python",
@@ -69,23 +91,31 @@ def main() -> int:
     plugin_destination = hermes_home / "plugins" / "atak"
     skill_destination = hermes_home / "skills" / "productivity" / "atak"
 
-    for filename in PLUGIN_FILES:
-        copy_file(
-            repository / "plugin" / filename,
-            plugin_destination / filename,
+    if args.link:
+        link_directory(
+            repository / "plugin",
+            plugin_destination,
             dry_run=args.dry_run,
         )
-    copy_file(
-        repository / "SKILL.md",
-        skill_destination / "SKILL.md",
-        dry_run=args.dry_run,
-    )
-    for reference in sorted((repository / "references").glob("*.md")):
+        link_directory(repository, skill_destination, dry_run=args.dry_run)
+    else:
+        for filename in PLUGIN_FILES:
+            copy_file(
+                repository / "plugin" / filename,
+                plugin_destination / filename,
+                dry_run=args.dry_run,
+            )
         copy_file(
-            reference,
-            skill_destination / "references" / reference.name,
+            repository / "SKILL.md",
+            skill_destination / "SKILL.md",
             dry_run=args.dry_run,
         )
+        for reference in sorted((repository / "references").glob("*.md")):
+            copy_file(
+                reference,
+                skill_destination / "references" / reference.name,
+                dry_run=args.dry_run,
+            )
 
     if args.gateway_python:
         if not args.uv:

@@ -9,7 +9,7 @@
 
 ## Install Files
 
-From the repository root:
+For a deployed copy:
 
 ```bash
 python scripts/install.py \
@@ -17,8 +17,24 @@ python scripts/install.py \
   --gateway-python /path/to/hermes/python
 ```
 
-This fetches the pinned `frogcot` 1.2.0 and `froggeolib` 1.1.0 Git tags. To
-develop the libraries in parallel, install the live worktrees instead:
+For a local source-of-truth checkout, use symlinks:
+
+```bash
+python scripts/install.py \
+  --link \
+  --hermes-home ~/.hermes \
+  --gateway-python /path/to/hermes/python \
+  --frogcot /path/to/live/frogcot \
+  --froggeolib /path/to/live/froggeolib
+```
+
+This makes the repository authoritative for both the platform plugin and
+Hermes skill. Do not edit `~/.hermes/plugins/atak` or
+`~/.hermes/skills/productivity/atak`; those paths point back here.
+
+When checkout paths are omitted, the installer fetches the pinned `frogcot`
+1.2.0 and `froggeolib` 1.1.0 Git tags. To develop the libraries in parallel,
+provide the live worktrees:
 
 ```bash
 python scripts/install.py \
