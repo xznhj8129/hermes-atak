@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hermes ATAK"
+  short_description: "Connect Hermes to ATAK and OpenTAKServer"
+  default_prompt: "Use $hermes-atak to install or operate the Hermes ATAK integration."

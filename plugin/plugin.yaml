@@ -1,0 +1,19 @@
+name: atak-platform
+label: ATAK / CoT
+kind: platform
+version: 1.2.0
+description: >
+  Passive ATAK GeoChat messaging adapter for Hermes. Maintains a persistent
+  mutual-TLS CoT stream, reconciles OpenTAKServer-retained markers on demand,
+  forwards inbound GeoChat to the normal Hermes gateway handler, and sends the
+  final response directly to the originating ATAK peer.
+author: Local
+optional_env:
+  - name: ATAK_ALLOWED_USERS
+    description: "Comma-separated ATAK sender UIDs allowed to message Hermes"
+    prompt: "Allowed ATAK UIDs (comma-separated)"
+    password: false
+  - name: ATAK_ALLOW_ALL_USERS
+    description: "Allow every mutually authenticated CoT sender (use with care)"
+    prompt: "Allow all ATAK users? (true/false)"
+    password: false

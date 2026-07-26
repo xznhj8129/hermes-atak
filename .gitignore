@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+config.yaml
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.log
+*.db
+*.sqlite*
+sessions/
+pairing/
