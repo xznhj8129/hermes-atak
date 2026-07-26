@@ -1,7 +1,7 @@
 name: atak-platform
 label: ATAK / CoT
 kind: platform
-version: 1.2.1
+version: 1.2.2
 description: >
   Passive ATAK GeoChat messaging adapter for Hermes. Maintains a persistent
   mutual-TLS CoT stream, reconciles OpenTAKServer-retained markers on demand,

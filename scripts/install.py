@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 
 
-PLUGIN_FILES = ("adapter.py", "ots_snapshot.py", "plugin.yaml")
+PLUGIN_FILES = ("__init__.py", "adapter.py", "ots_snapshot.py", "plugin.yaml")
 FROGCOT_REMOTE = (
     "frogcot @ git+https://github.com/xznhj8129/frogcot.git@v1.2.0"
 )
