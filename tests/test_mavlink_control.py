@@ -3,11 +3,20 @@ from __future__ import annotations
 import time
 from types import SimpleNamespace
 
+import pytest
+
+from plugin import mavlink_control as mavlink_control_module
 from plugin.mavlink_control import (
     ControlJob,
     MAV_MODE_FLAG_SAFETY_ARMED,
     MavlinkControlService,
 )
+
+
+@pytest.fixture(autouse=True)
+def fake_mavutil(monkeypatch):
+    fake = SimpleNamespace(mode_mapping_byname=lambda _mav_type: {"GUIDED": 4})
+    monkeypatch.setattr(mavlink_control_module, "mavutil", fake)
 
 
 def vehicle_state(**values):
