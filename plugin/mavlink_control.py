@@ -228,6 +228,7 @@ class MavlinkControlService:
         except Exception as exc:
             logger.warning("MAVLink control job %s failed: %s", job.id, exc)
             await self._update(job, "failed", f"{type(exc).__name__}: {exc}")
+            await self._notify_unexpected_failure(job)
 
     async def _execute(self, job: ControlJob, state) -> None:
         action = job.action
@@ -516,11 +517,13 @@ class MavlinkControlService:
         job.phase = phase
         job.message = message
         job.updated_unix = time.time()
+
+    async def _notify_unexpected_failure(self, job: ControlJob) -> None:
         if job.notify_chat_id:
             try:
                 await self.notify(
                     job.notify_chat_id,
-                    f"{self.callsign(job.sysid)} [{job.id}] {phase}: {message}",
+                    f"{self.callsign(job.sysid)} [{job.id}] failed unexpectedly",
                 )
             except Exception as exc:
                 logger.warning("MAVLink job %s TAK feedback failed: %s", job.id, exc)

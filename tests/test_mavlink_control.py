@@ -87,13 +87,7 @@ async def test_takeoff_auto_arms_verifies_mode_and_climb(monkeypatch):
     assert commands[1][2] == (1.0, 4.0)
     assert commands[2][2][-1] == 20.0
     assert job.phase == "succeeded"
-    messages = [message for _chat_id, message in notifications]
-    assert any(
-        "vehicle disarmed; sending arm command" in message for message in messages
-    )
-    assert any("armed state verified" in message for message in messages)
-    assert any("verifying guided mode 4" in message for message in messages)
-    assert any("verifying climb to 20.0 m" in message for message in messages)
+    assert notifications == []
 
 
 async def test_takeoff_stops_when_armed_telemetry_is_not_observed(monkeypatch):
@@ -117,6 +111,7 @@ async def test_takeoff_stops_when_armed_telemetry_is_not_observed(monkeypatch):
         notify_chat_id="chat-1",
         arguments={"altitude_m": 20.0},
     )
+    service.jobs[job.id] = job
 
     await service._run_job(job)
 
@@ -127,4 +122,9 @@ async def test_takeoff_stops_when_armed_telemetry_is_not_observed(monkeypatch):
     assert job.message == (
         "TimeoutError: expected telemetry transition was not observed"
     )
-    assert "failed: TimeoutError" in notifications[-1][1]
+    assert notifications == [
+        ("chat-1", "UAV-7 [takeoff-failed] failed unexpectedly")
+    ]
+    assert service.jobs_status(job.id)["job"]["message"] == (
+        "TimeoutError: expected telemetry transition was not observed"
+    )
