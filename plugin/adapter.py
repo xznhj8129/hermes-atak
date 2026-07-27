@@ -18,7 +18,7 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 
 from gateway.config import Platform
 from gateway.platforms.base import (
@@ -27,6 +27,13 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+
+from .mavlink_bridge import (
+    MavlinkTelemetryBridge,
+    VehicleTelemetry,
+    pymavlink_available,
+)
+from .mavlink_control import MavlinkControlService, json_result
 
 try:
     from frogcot import (
@@ -94,6 +101,20 @@ def _configured(extra: dict, key: str) -> str:
     return str(value).strip() if value is not None else ""
 
 
+def _enabled(extra: dict, key: str) -> bool:
+    if key not in extra or extra[key] is None:
+        return False
+    value = extra[key]
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"", "0", "false", "no", "off"}:
+            return False
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        raise ValueError(f"ATAK {key} must be true or false")
+    return bool(value)
+
+
 class ATAKAdapter(BasePlatformAdapter):
     """Persistent CoT transport and GeoChat-to-Hermes translation adapter."""
 
@@ -119,6 +140,59 @@ class ATAKAdapter(BasePlatformAdapter):
         self.ots_python = _configured(extra, "ots_python")
         self.ots_config = _configured(extra, "ots_config")
         self.ots_snapshot_ttl = max(0.0, float(extra.get("ots_snapshot_ttl", 2.0)))
+        self.mavlink_enabled = _enabled(extra, "mavlink_enabled")
+        self.mavlink_endpoint = (
+            _configured(extra, "mavlink_endpoint") or "tcp:127.0.0.1:5760"
+        )
+        self.mavlink_publish_cadence = max(
+            0.1, float(extra.get("mavlink_publish_cadence", 1.0))
+        )
+        self.mavlink_freshness = max(
+            0.1, float(extra.get("mavlink_freshness", 5.0))
+        )
+        self.mavlink_stale = max(
+            self.mavlink_publish_cadence,
+            float(extra.get("mavlink_stale", 10.0)),
+        )
+        self.mavlink_callsign_prefix = (
+            _configured(extra, "mavlink_callsign_prefix") or "UAV"
+        )
+        configured_callsigns = extra.get("mavlink_callsigns", {})
+        if configured_callsigns is None:
+            configured_callsigns = {}
+        if not isinstance(configured_callsigns, Mapping):
+            raise ValueError("ATAK mavlink_callsigns must be a sysid-to-callsign map")
+        self.mavlink_callsigns = {
+            str(sysid): str(callsign).strip()
+            for sysid, callsign in configured_callsigns.items()
+            if str(callsign).strip()
+        }
+        self.mavlink_cot_type = (
+            _configured(extra, "mavlink_cot_type") or "a-f-A-M-F-Q"
+        )
+        self.mavlink_reconnect_initial = max(
+            0.1, float(extra.get("mavlink_reconnect_initial", 1.0))
+        )
+        self.mavlink_reconnect_max = max(
+            self.mavlink_reconnect_initial,
+            float(extra.get("mavlink_reconnect_max", 30.0)),
+        )
+        self.mavlink_control_timeout = max(
+            5.0, float(extra.get("mavlink_control_timeout", 60.0))
+        )
+        self.mavlink_arrival_radius = max(
+            1.0, float(extra.get("mavlink_arrival_radius", 10.0))
+        )
+        self.mavlink_follow_cadence = min(
+            10.0, max(1.0, float(extra.get("mavlink_follow_cadence", 2.0)))
+        )
+        self.mavlink_follow_deadband = min(
+            100.0, max(2.0, float(extra.get("mavlink_follow_deadband", 5.0)))
+        )
+        self.mavlink_follow_pli_freshness = min(
+            300.0,
+            max(5.0, float(extra.get("mavlink_follow_pli_freshness", 30.0))),
+        )
 
         self.situational_awareness = SituationalAwareness() if SituationalAwareness else None
         self._atak = ATAKClient(self.callsign, cottype=self.cot_type, is_self=True) if ATAKClient else None
@@ -139,6 +213,33 @@ class ATAKAdapter(BasePlatformAdapter):
         self._server_markers: Dict[str, Any] = {}
         self._ots_snapshot_at = 0.0
         self._ots_snapshot_error: Optional[str] = None
+        self._mavlink_bridge = (
+            MavlinkTelemetryBridge(
+                endpoint=self.mavlink_endpoint,
+                publish=self._publish_uav_marker,
+                freshness=self.mavlink_freshness,
+                cadence=self.mavlink_publish_cadence,
+                reconnect_initial=self.mavlink_reconnect_initial,
+                reconnect_max=self.mavlink_reconnect_max,
+            )
+            if self.mavlink_enabled
+            else None
+        )
+        self._mavlink_control = (
+            MavlinkControlService(
+                bridge=self._mavlink_bridge,
+                callsign=self._uav_callsign,
+                resolve_point=self._resolve_control_point,
+                notify=self._notify_control_progress,
+                resolve_contact=self._resolve_follow_contact,
+                command_timeout=self.mavlink_control_timeout,
+                arrival_radius=self.mavlink_arrival_radius,
+                follow_cadence=self.mavlink_follow_cadence,
+                follow_deadband=self.mavlink_follow_deadband,
+            )
+            if self._mavlink_bridge is not None
+            else None
+        )
 
         # A configured home channel makes proactive cross-platform sends work
         # before the peer has sent a message during this process lifetime.
@@ -197,6 +298,13 @@ class ATAKAdapter(BasePlatformAdapter):
                 "dependency_missing", "frogcot is not importable", retryable=False
             )
             return False
+        if self.mavlink_enabled and not pymavlink_available():
+            self._set_fatal_error(
+                "dependency_missing",
+                "pymavlink is required when ATAK MAVLink telemetry is enabled",
+                retryable=False,
+            )
+            return False
         missing = self._missing_config()
         if missing:
             message = "missing ATAK platform extra: " + ", ".join(missing)
@@ -221,6 +329,10 @@ class ATAKAdapter(BasePlatformAdapter):
         self._presence_task = asyncio.create_task(
             self._presence_loop(), name="atak-cot-presence"
         )
+        if self._mavlink_bridge is not None:
+            self._mavlink_bridge.start()
+        if self._mavlink_control is not None:
+            self._mavlink_control.start()
         logger.info("ATAK: connected to %s:%s as %s", self.host, self.port, self.callsign)
         return True
 
@@ -246,7 +358,10 @@ class ATAKAdapter(BasePlatformAdapter):
     async def _send_presence(self) -> None:
         client = self._client
         if client is not None and self.position is not None:
-            await asyncio.to_thread(client.send, self._atak.pli(self.position))
+            payload = self._atak.pli(self.position)
+            async with self._send_lock:
+                if client is self._client:
+                    await asyncio.to_thread(client.send, payload)
 
     async def _presence_loop(self) -> None:
         while not self._stopping.is_set():
@@ -261,6 +376,10 @@ class ATAKAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         self._stopping.set()
         self._mark_disconnected()
+        if self._mavlink_control is not None:
+            await self._mavlink_control.stop()
+        if self._mavlink_bridge is not None:
+            await self._mavlink_bridge.stop()
         presence_task, self._presence_task = self._presence_task, None
         if presence_task is not None and presence_task is not asyncio.current_task():
             presence_task.cancel()
@@ -274,6 +393,97 @@ class ATAKAdapter(BasePlatformAdapter):
                 await task
             except asyncio.CancelledError:
                 pass
+
+    def _uav_uid(self, sysid: int) -> str:
+        return f"{self.uid}-uav-{int(sysid)}"
+
+    def _uav_callsign(self, sysid: int) -> str:
+        return self.mavlink_callsigns.get(
+            str(int(sysid)), f"{self.mavlink_callsign_prefix}-{int(sysid)}"
+        )
+
+    def _resolve_control_point(self, value: str):
+        return _state_record(self, value).point
+
+    def _resolve_follow_contact(self, value: str):
+        contact = self.situational_awareness.get_contact(str(value))
+        if contact is None:
+            raise KeyError(value)
+        event_time = contact.time
+        if event_time.tzinfo is None:
+            event_time = event_time.replace(tzinfo=datetime.timezone.utc)
+        age = (
+            datetime.datetime.now(datetime.timezone.utc) - event_time
+        ).total_seconds()
+        if age < -5.0:
+            raise ValueError(f"ATAK PLI for {value!r} is dated in the future")
+        if age > self.mavlink_follow_pli_freshness:
+            raise ValueError(
+                f"ATAK PLI for {value!r} is stale ({age:.1f} s old; "
+                f"limit {self.mavlink_follow_pli_freshness:.1f} s)"
+            )
+        return contact
+
+    async def _notify_control_progress(self, chat_id: str, content: str) -> None:
+        result = await self.send(chat_id, content)
+        if not result.success:
+            raise RuntimeError(result.error or "ATAK progress send failed")
+
+    def _serialize_uav_marker(self, vehicle: VehicleTelemetry) -> bytes:
+        """Serialize one factual location update with stable per-sysid identity."""
+        position = {
+            "lat": vehicle.latitude,
+            "lon": vehicle.longitude,
+            "alt": vehicle.altitude,
+            "ce": 9999999.0,
+            "le": 9999999.0,
+        }
+        payload = self._atak.cot_marker(
+            self._uav_callsign(vehicle.sysid),
+            self._uav_uid(vehicle.sysid),
+            self.mavlink_cot_type,
+            position,
+        )
+        if not payload:
+            raise RuntimeError("frogcot could not serialize UAV marker")
+        root = ET.fromstring(payload)
+        event_time = datetime.datetime.fromisoformat(
+            root.get("time", "").replace("Z", "+00:00")
+        )
+        stale = event_time + datetime.timedelta(seconds=self.mavlink_stale)
+        root.set("stale", stale.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
+        detail = _child(root, "detail")
+        if detail is not None and (
+            vehicle.ground_speed is not None or vehicle.course is not None
+        ):
+            track = ET.SubElement(detail, "track")
+            if vehicle.ground_speed is not None:
+                track.set("speed", str(vehicle.ground_speed))
+            if vehicle.course is not None:
+                track.set("course", str(vehicle.course))
+        if detail is not None and vehicle.battery_remaining is not None:
+            status = ET.SubElement(detail, "status")
+            status.set("battery", str(vehicle.battery_remaining))
+        return ET.tostring(root)
+
+    async def _publish_uav_marker(self, vehicle: VehicleTelemetry) -> bool:
+        client = self._client
+        if client is None or not getattr(client, "connected", False):
+            return False
+        try:
+            payload = self._serialize_uav_marker(vehicle)
+            async with self._send_lock:
+                if client is not self._client or not getattr(client, "connected", False):
+                    return False
+                await asyncio.to_thread(client.send, payload)
+            return True
+        except Exception as exc:
+            logger.warning(
+                "ATAK: UAV marker send failed for MAVLink sysid %s: %s",
+                vehicle.sysid,
+                exc,
+            )
+            return False
 
     async def _receive_loop(self) -> None:
         backoff = self.reconnect_initial
@@ -618,6 +828,7 @@ def atak_state_tool(args, **_kwargs) -> str:
     if action == "status":
         client = adapter._client
         markers = _all_markers(adapter)
+        mavlink_bridge = adapter._mavlink_bridge
         return json.dumps(
             {
                 "success": True,
@@ -632,6 +843,16 @@ def atak_state_tool(args, **_kwargs) -> str:
                 "chats": len(state.chats),
                 "receipts": len(adapter._receipts),
                 "geospatial_provider": "froggeolib",
+                "mavlink_enabled": adapter.mavlink_enabled,
+                "mavlink_connected": bool(
+                    mavlink_bridge is not None
+                    and mavlink_bridge._connection is not None
+                ),
+                "mavlink_vehicles": (
+                    len(mavlink_bridge.tracker.vehicles)
+                    if mavlink_bridge is not None
+                    else 0
+                ),
             }
         )
 
@@ -737,8 +958,57 @@ def atak_state_tool(args, **_kwargs) -> str:
     return json.dumps({"success": False, "error": "Unknown ATAK state action"})
 
 
+def mavlink_uav_tool(args, **_kwargs) -> str:
+    """Submit a targeted command or inspect the persistent UAV controller."""
+    adapter = _live_adapter()
+    if adapter is None:
+        return json_result({"success": False, "error": "ATAK adapter is not running"})
+    control = adapter._mavlink_control
+    if control is None:
+        return json_result(
+            {
+                "success": False,
+                "error": "MAVLink is disabled; enable ATAK mavlink_enabled",
+            }
+        )
+
+    action = str(args.get("action", "status")).strip().lower()
+    if action == "status":
+        sysid = args.get("sysid")
+        try:
+            selected = int(sysid) if sysid is not None else None
+        except (TypeError, ValueError):
+            return json_result({"success": False, "error": "sysid must be an integer"})
+        return json_result(control.status(selected))
+    if action == "jobs":
+        return json_result(control.jobs_status(str(args.get("job_id", "")).strip()))
+    if action == "cancel":
+        job_id = str(args.get("job_id", "")).strip()
+        if not job_id:
+            return json_result({"success": False, "error": "job_id is required"})
+        return json_result(control.cancel(job_id))
+
+    command_args = dict(args)
+    notify_chat_id = ""
+    try:
+        from gateway.session_context import get_session_env
+
+        if get_session_env("HERMES_SESSION_PLATFORM", "") == "atak":
+            if bool(args.get("notify", True)):
+                notify_chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+            if action == "follow" and not str(args.get("target", "")).strip():
+                command_args["target"] = get_session_env(
+                    "HERMES_SESSION_USER_ID", ""
+                ).strip()
+    except Exception:
+        pass
+    return json_result(
+        control.submit(action, command_args, notify_chat_id=notify_chat_id)
+    )
+
+
 def check_requirements() -> bool:
-    """Return whether frogcot is importable; credentials live only in config."""
+    """Check base dependencies; enabled MAVLink is checked during connect."""
     return all(
         dependency is not None
         for dependency in (
@@ -773,7 +1043,8 @@ def register(ctx) -> None:
         is_connected=is_connected,
         required_env=[],
         install_hint=(
-            "Install frogcot 1.2+ and froggeolib 1.1+ into the Hermes environment"
+            "Install frogcot 1.2+, froggeolib 1.1+, and pymavlink 2.4.47 "
+            "into the Hermes environment"
         ),
         allowed_users_env="ATAK_ALLOWED_USERS",
         allow_all_env="ATAK_ALLOW_ALL_USERS",
@@ -782,7 +1053,15 @@ def register(ctx) -> None:
         allow_update_command=False,
         platform_hint=(
             "You are replying through ATAK direct GeoChat. Use concise plain text; "
-            "the adapter returns your final response to the originating ATAK peer."
+            "the adapter returns your final response to the originating ATAK peer. "
+            "Interpret UAV instructions as operational outcomes; the tool's actions "
+            "are composable motion capabilities, not a whitelist of valid orders. "
+            "Infer the intended behavior instead of matching the user's words to an "
+            "action name. For 'follow me', call mavlink_uav with action=follow and "
+            "sysid=1; omit target so the current ATAK sender's live PLI is used. "
+            "Call mavlink_uav once, acknowledge its job immediately, "
+            "and end the turn; never expose MAVLink mechanics, poll the job in the "
+            "same turn, or edit/test code during an operation."
         ),
     )
     ctx.register_tool(
@@ -833,4 +1112,86 @@ def register(ctx) -> None:
         check_fn=check_requirements,
         description="Live ATAK/CoT situational state",
         emoji="🛰️",
+    )
+    ctx.register_tool(
+        name="mavlink_uav",
+        toolset="atak",
+        schema={
+            "name": "mavlink_uav",
+            "description": (
+                "Persistent semantic flight runtime. Use action=follow for a "
+                "continuing live ATAK PLI follow job. For other operational orders, use "
+                "action=run with a short in-memory procedure composed from awaitable "
+                "takeoff, goto, arm, disarm, hold, rtl, land, sleep, and progress; "
+                "conditions may use distance, armed, airborne, and running. This is "
+                "not a natural-language action whitelist. takeoff owns all readiness "
+                "and climb mechanics. goto accepts a live FrogCoT UID/callsign or "
+                "coordinates/offset and owns navigation mechanics. Procedures run "
+                "as background jobs and are never written to disk. Provide an exact "
+                "vehicle sysid."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "status",
+                            "jobs",
+                            "cancel",
+                            "follow",
+                            "run",
+                        ],
+                    },
+                    "sysid": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 254,
+                        "description": "Exact target vehicle sysid; required for commands.",
+                    },
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job identifier for jobs or cancel.",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "Exact live ATAK contact UID/callsign for follow. Omit "
+                            "only for 'follow me' in an ATAK GeoChat session, where "
+                            "the current sender UID is inferred."
+                        ),
+                    },
+                    "altitude_m": {
+                        "type": "number",
+                        "minimum": 1,
+                        "maximum": 120,
+                        "description": (
+                            "Requested relative altitude for follow; defaults to "
+                            "the UAV's current relative altitude."
+                        ),
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": (
+                            "In-memory async flight procedure. Examples: "
+                            "'await takeoff(50)' or "
+                            "'while running():\\n    await goto(\"CONTACT_UID\", "
+                            "wait=False)\\n    await sleep(2)'. No imports, raw "
+                            "protocol access, files, attributes, or function "
+                            "definitions are available."
+                        ),
+                    },
+                    "notify": {
+                        "type": "boolean",
+                        "description": "Send job milestones to the originating ATAK chat.",
+                        "default": True,
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+        handler=mavlink_uav_tool,
+        check_fn=check_requirements,
+        description="Persistent MAVLink UAV control and live job status",
+        emoji="🚁",
     )

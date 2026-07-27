@@ -1,13 +1,15 @@
-"""Persistent, targeted MAVLink command API for the Hermes ATAK plugin.
+"""Persistent, targeted flight runtime for the Hermes ATAK plugin.
 
-The gateway owns one long-lived controller. Tool calls enqueue small jobs and
-return immediately; the jobs use telemetry retained by ``mavlink_bridge`` for
-preflight checks and post-command verification. No per-command Python scripts
-or per-command MAVLink connections are created.
+The gateway owns one long-lived controller. The public functions are reusable
+motion capabilities, not a whitelist of natural-language orders. Tool calls
+enqueue jobs and return immediately; jobs may be one-shot outcomes or
+long-running procedures composed from those capabilities. No per-command
+Python scripts or per-command MAVLink connections are created.
 """
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import logging
@@ -38,6 +40,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 Notify = Callable[[str, str], Awaitable[None]]
 ResolvePoint = Callable[[str], Any]
+ResolveContact = Callable[[str], Any]
 
 MAV_MODE_FLAG_SAFETY_ARMED = 128
 MAV_MODE_FLAG_CUSTOM_MODE_ENABLED = 1
@@ -85,15 +88,21 @@ class MavlinkControlService:
         callsign: Callable[[int], str],
         resolve_point: ResolvePoint,
         notify: Notify,
+        resolve_contact: Optional[ResolveContact] = None,
         command_timeout: float = 60.0,
         arrival_radius: float = 10.0,
+        follow_cadence: float = 2.0,
+        follow_deadband: float = 5.0,
     ):
         self.bridge = bridge
         self.callsign = callsign
         self.resolve_point = resolve_point
         self.notify = notify
+        self.resolve_contact = resolve_contact
         self.command_timeout = max(5.0, float(command_timeout))
         self.arrival_radius = max(1.0, float(arrival_radius))
+        self.follow_cadence = min(10.0, max(1.0, float(follow_cadence)))
+        self.follow_deadband = min(100.0, max(2.0, float(follow_deadband)))
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.jobs: Dict[str, ControlJob] = {}
         self._jobs_lock = threading.Lock()
@@ -152,14 +161,15 @@ class MavlinkControlService:
         if self._stopping or self.loop is None or not self.loop.is_running():
             return {"success": False, "error": "MAVLink control service is not running"}
         if action not in {
+            "run",
             "arm",
             "disarm",
-            "set_mode",
             "takeoff",
             "land",
             "rtl",
             "hold",
             "goto",
+            "follow",
         }:
             return {"success": False, "error": f"unsupported action: {action}"}
         try:
@@ -176,6 +186,20 @@ class MavlinkControlService:
             }
         if not self._fresh(state):
             return {"success": False, "error": f"sysid {sysid} heartbeat is stale"}
+        if action == "follow":
+            target = str(args.get("target", "")).strip()
+            if not target:
+                return {
+                    "success": False,
+                    "error": (
+                        "follow requires a live ATAK target contact/callsign; "
+                        "use it from an ATAK GeoChat session to infer 'me'"
+                    ),
+                }
+            try:
+                self._resolve_follow_contact(target)
+            except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+                return {"success": False, "error": str(exc)}
 
         job = ControlJob(
             id=uuid.uuid4().hex[:12],
@@ -224,108 +248,47 @@ class MavlinkControlService:
                 await self._update(job, "commanding", "preflight passed; transmitting command")
                 await self._execute(job, state)
         except asyncio.CancelledError:
-            await self._update(job, "cancelled", "monitoring job cancelled; no retry sent")
+            if job.action == "follow":
+                await self._cancel_follow(job)
+            else:
+                await self._update(
+                    job, "cancelled", "monitoring job cancelled; no retry sent"
+                )
         except Exception as exc:
             logger.warning("MAVLink control job %s failed: %s", job.id, exc)
-            await self._update(job, "failed", f"{type(exc).__name__}: {exc}")
-            await self._notify_unexpected_failure(job)
+            await self._update(job, "failed", str(exc))
 
     async def _execute(self, job: ControlJob, state) -> None:
         action = job.action
-        if action == "arm":
-            await self._command_long(job.sysid, "MAV_CMD_COMPONENT_ARM_DISARM", 1.0)
-            await self._verify(job, lambda item: self._armed(item), "armed")
-        elif action == "disarm":
-            await self._command_long(job.sysid, "MAV_CMD_COMPONENT_ARM_DISARM", 0.0)
-            await self._verify(job, lambda item: not self._armed(item), "disarmed")
-        elif action == "set_mode":
-            if "custom_mode" not in job.arguments:
-                raise ValueError("set_mode requires custom_mode")
-            base_mode = int(job.arguments.get("base_mode", 1))
-            custom_mode = int(job.arguments["custom_mode"])
+        if action == "run":
+            await self._run_procedure(job)
+        elif action == "arm":
             await self._command_long(
                 job.sysid,
-                "MAV_CMD_DO_SET_MODE",
-                float(base_mode),
-                float(custom_mode),
+                "MAV_CMD_COMPONENT_ARM_DISARM",
+                1.0,
+                operator_label="arm",
             )
-            await self._verify(
-                job,
-                lambda item: item.custom_mode == custom_mode,
-                f"custom mode {custom_mode} verified",
+            await self._verify(job, lambda item: self._armed(item), "armed")
+        elif action == "disarm":
+            await self._command_long(
+                job.sysid,
+                "MAV_CMD_COMPONENT_ARM_DISARM",
+                0.0,
+                operator_label="disarm",
             )
+            await self._verify(job, lambda item: not self._armed(item), "disarmed")
         elif action == "takeoff":
             altitude = float(job.arguments.get("altitude_m", 10.0))
             if not 1.0 <= altitude <= 120.0:
                 raise ValueError("takeoff altitude_m must be between 1 and 120")
-            guided_mode = self._guided_mode(state)
-            if not self._armed(state):
-                await self._update(
-                    job,
-                    "commanding",
-                    "vehicle disarmed; sending arm command",
-                )
-                await self._command_long(
-                    job.sysid, "MAV_CMD_COMPONENT_ARM_DISARM", 1.0
-                )
-                await self._update(
-                    job,
-                    "monitoring",
-                    "arm command accepted; verifying armed telemetry",
-                )
-                state = await self._wait(
-                    job.sysid, lambda item: self._armed(item)
-                )
-                await self._update(
-                    job,
-                    "commanding",
-                    "armed state verified; preparing autonomous takeoff",
-                )
-
-            if guided_mode is not None and state.custom_mode != guided_mode:
-                await self._update(
-                    job,
-                    "commanding",
-                    f"selecting guided mode {guided_mode} for autonomous takeoff",
-                )
-                await self._command_long(
-                    job.sysid,
-                    "MAV_CMD_DO_SET_MODE",
-                    float(MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
-                    float(guided_mode),
-                )
-                await self._update(
-                    job,
-                    "monitoring",
-                    f"mode command accepted; verifying guided mode {guided_mode}",
-                )
-                state = await self._wait(
-                    job.sysid,
-                    lambda item: item.custom_mode == guided_mode,
-                )
-
-            await self._update(
-                job,
-                "commanding",
-                f"takeoff mode ready; requesting {altitude:.1f} m",
-            )
-            await self._command_long(
-                job.sysid, "MAV_CMD_NAV_TAKEOFF", 0, 0, 0, math.nan, 0, 0, altitude
-            )
-            await self._update(
-                job,
-                "monitoring",
-                f"takeoff command accepted; verifying climb to {altitude:.1f} m",
-            )
-            await self._wait(
-                job.sysid,
-                lambda item: (item.relative_altitude or 0.0) >= altitude * 0.8,
-            )
-            await self._succeed(
-                job, f"airborne at target band ({altitude:.1f} m requested)"
-            )
+            await self._takeoff(job, state, altitude, finish=True)
         elif action == "land":
-            await self._command_long(job.sysid, "MAV_CMD_NAV_LAND")
+            await self._command_long(
+                job.sysid,
+                "MAV_CMD_NAV_LAND",
+                operator_label="land",
+            )
             await self._verify(
                 job,
                 lambda item: not self._armed(item)
@@ -337,21 +300,54 @@ class MavlinkControlService:
                 timeout=max(120.0, self.command_timeout),
             )
         elif action == "rtl":
-            await self._command_long(job.sysid, "MAV_CMD_NAV_RETURN_TO_LAUNCH")
-            await self._succeed(job, "RTL command acknowledged by vehicle")
+            original_mode = state.custom_mode
+            expected_mode = self._ardupilot_mode(state, "RTL")
+            await self._command_long(
+                job.sysid,
+                "MAV_CMD_NAV_RETURN_TO_LAUNCH",
+                operator_label="return home",
+            )
+            await self._verify(
+                job,
+                (
+                    (lambda item: item.custom_mode == expected_mode)
+                    if expected_mode is not None
+                    else (lambda item: item.custom_mode != original_mode)
+                ),
+                "return-to-home flight state verified",
+            )
         elif action == "hold":
-            await self._command_long(job.sysid, "MAV_CMD_NAV_LOITER_UNLIM")
-            await self._succeed(job, "hold/loiter command acknowledged by vehicle")
+            original_mode = state.custom_mode
+            expected_mode = self._ardupilot_mode(state, "LOITER")
+            await self._command_long(
+                job.sysid,
+                "MAV_CMD_NAV_LOITER_UNLIM",
+                operator_label="hold position",
+            )
+            await self._verify(
+                job,
+                (
+                    (lambda item: item.custom_mode == expected_mode)
+                    if expected_mode is not None
+                    else (lambda item: item.custom_mode != original_mode)
+                ),
+                "hold flight state verified",
+            )
         elif action == "goto":
-            target = self._resolve_target(job, state)
+            current_altitude = float(state.relative_altitude or 0.0)
             altitude = float(
                 job.arguments.get(
                     "altitude_m",
-                    state.relative_altitude
-                    if state.relative_altitude is not None
-                    else 10.0,
+                    current_altitude if current_altitude > 1.0 else 10.0,
                 )
             )
+            if not 1.0 <= altitude <= 120.0:
+                raise ValueError("flight altitude must be between 1 and 120 m")
+            if not self._airborne(state):
+                await self._takeoff(job, state, altitude, finish=False)
+                state = self._require_fresh(job.sysid)
+            await self._ensure_navigation_ready(job, state)
+            target = self._resolve_target(job, state)
             start = self._position(state)
             initial = gps_to_vector(start, target).dist
             if initial <= self.arrival_radius:
@@ -365,9 +361,329 @@ class MavlinkControlService:
                 "monitoring",
                 f"goto transmitted; {initial:.0f} m from target",
             )
-            await self._verify_goto(job, target, initial)
+            if bool(job.arguments.get("wait", True)):
+                await self._verify_goto(job, target, initial)
+        elif action == "follow":
+            await self._follow(job, state)
         else:
             raise ValueError(f"unsupported action: {action}")
+
+    async def _follow(self, job: ControlJob, state) -> None:
+        target_name = str(job.arguments.get("target", "")).strip()
+        contact = self._resolve_follow_contact(target_name)
+        target_uid = str(getattr(contact, "uid", "") or target_name)
+        current_altitude = float(state.relative_altitude or 0.0)
+        altitude = float(
+            job.arguments.get(
+                "altitude_m",
+                current_altitude if current_altitude > 1.0 else 10.0,
+            )
+        )
+        if not 1.0 <= altitude <= 120.0:
+            raise ValueError("follow altitude_m must be between 1 and 120 m")
+        if not self._airborne(state):
+            await self._takeoff(job, state, altitude, finish=False)
+            state = self._require_fresh(job.sysid)
+        await self._ensure_navigation_ready(job, state)
+
+        label = str(
+            getattr(contact, "callsign", "")
+            or getattr(contact, "uid", target_name)
+        )
+        await self._update(
+            job,
+            "monitoring",
+            f"following {label} at {altitude:.1f} m relative altitude",
+        )
+        last_target = None
+        updates = 0
+        while True:
+            self._require_fresh(job.sysid)
+            contact = self._resolve_follow_contact(target_uid)
+            point = self._contact_position(contact)
+            moved = (
+                math.inf
+                if last_target is None
+                else gps_to_vector(last_target, point).dist
+            )
+            if moved >= self.follow_deadband:
+                await self._goto(job.sysid, point.lat, point.lon, altitude)
+                last_target = point
+                updates += 1
+                job.message = (
+                    f"following {label}; target update {updates} sent "
+                    f"({moved:.1f} m movement)"
+                    if math.isfinite(moved)
+                    else f"following {label}; initial target sent"
+                )
+                job.updated_unix = time.time()
+            await asyncio.sleep(self.follow_cadence)
+
+    async def _cancel_follow(self, job: ControlJob) -> None:
+        message = "follow cancelled; target updates stopped"
+        try:
+            await self._command_long(
+                job.sysid,
+                "MAV_CMD_NAV_LOITER_UNLIM",
+                operator_label="hold after follow cancellation",
+            )
+            message += "; hold acknowledged"
+        except Exception as exc:
+            logger.warning(
+                "MAVLink follow job %s could not confirm hold: %s", job.id, exc
+            )
+            message += "; hold could not be confirmed"
+        await self._update(job, "cancelled", message)
+
+    async def _run_procedure(self, job: ControlJob) -> None:
+        """Run a model-composed procedure against semantic in-process functions."""
+        source = str(job.arguments.get("code", "")).strip()
+        if not source:
+            raise ValueError("run requires flight procedure code")
+        tree = self._validate_procedure(source)
+
+        async def invoke(action: str, **arguments):
+            child = ControlJob(
+                id=job.id,
+                action=action,
+                sysid=job.sysid,
+                arguments={"sysid": job.sysid, **arguments},
+            )
+            await self._execute(child, self._require_fresh(job.sysid))
+            job.message = child.message
+            job.updated_unix = time.time()
+
+        async def takeoff(altitude_m: float = 10.0):
+            await invoke("takeoff", altitude_m=altitude_m)
+
+        async def goto(
+            target=None,
+            *,
+            latitude=None,
+            longitude=None,
+            distance_m=None,
+            bearing_deg=None,
+            altitude_m=None,
+            wait=True,
+        ):
+            arguments = {"wait": bool(wait)}
+            if target is not None:
+                arguments["target"] = str(target)
+            if latitude is not None:
+                arguments["latitude"] = float(latitude)
+            if longitude is not None:
+                arguments["longitude"] = float(longitude)
+            if distance_m is not None:
+                arguments["distance_m"] = float(distance_m)
+            if bearing_deg is not None:
+                arguments["bearing_deg"] = float(bearing_deg)
+            if altitude_m is not None:
+                arguments["altitude_m"] = float(altitude_m)
+            await invoke("goto", **arguments)
+
+        async def simple(action: str):
+            await invoke(action)
+
+        def distance(target: str) -> float:
+            state = self._require_fresh(job.sysid)
+            probe = ControlJob(
+                id=job.id,
+                action="goto",
+                sysid=job.sysid,
+                arguments={"target": str(target)},
+            )
+            point = self._resolve_target(probe, state)
+            return float(gps_to_vector(self._position(state), point).dist)
+
+        async def progress(message: str):
+            await self._update(job, "monitoring", str(message))
+
+        environment = {
+            "__builtins__": {},
+            "takeoff": takeoff,
+            "goto": goto,
+            "arm": lambda: simple("arm"),
+            "disarm": lambda: simple("disarm"),
+            "hold": lambda: simple("hold"),
+            "rtl": lambda: simple("rtl"),
+            "land": lambda: simple("land"),
+            "sleep": asyncio.sleep,
+            "progress": progress,
+            "distance": distance,
+            "armed": lambda: self._armed(self._require_fresh(job.sysid)),
+            "airborne": lambda: self._airborne(self._require_fresh(job.sysid)),
+            "running": lambda: True,
+        }
+        await self._update(job, "monitoring", "flight procedure running")
+        compiled = compile(
+            tree,
+            "<flight-procedure>",
+            "exec",
+            flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT,
+        )
+        procedure = eval(compiled, environment, environment)
+        if procedure is not None:
+            await procedure
+        await self._succeed(job, "requested flight procedure completed")
+
+    @staticmethod
+    def _validate_procedure(source: str) -> ast.Module:
+        """Allow control flow and calls only to the semantic runtime surface."""
+        if len(source) > 4000:
+            raise ValueError("flight procedure is too large")
+        try:
+            tree = ast.parse(source, mode="exec")
+        except SyntaxError as exc:
+            raise ValueError(f"invalid flight procedure: {exc.msg}") from exc
+
+        allowed_calls = {
+            "takeoff",
+            "goto",
+            "arm",
+            "disarm",
+            "hold",
+            "rtl",
+            "land",
+            "sleep",
+            "progress",
+            "distance",
+            "armed",
+            "airborne",
+            "running",
+        }
+        allowed_nodes = (
+            ast.Module,
+            ast.Expr,
+            ast.Await,
+            ast.Call,
+            ast.Name,
+            ast.Load,
+            ast.Store,
+            ast.Constant,
+            ast.keyword,
+            ast.Assign,
+            ast.While,
+            ast.If,
+            ast.Compare,
+            ast.BoolOp,
+            ast.BinOp,
+            ast.UnaryOp,
+            ast.Break,
+            ast.Continue,
+            ast.Pass,
+            ast.Eq,
+            ast.NotEq,
+            ast.Lt,
+            ast.LtE,
+            ast.Gt,
+            ast.GtE,
+            ast.And,
+            ast.Or,
+            ast.Not,
+            ast.Add,
+            ast.Sub,
+            ast.Mult,
+            ast.Div,
+            ast.Mod,
+            ast.USub,
+        )
+        nodes = list(ast.walk(tree))
+        if len(nodes) > 250:
+            raise ValueError("flight procedure is too complex")
+        for node in nodes:
+            if not isinstance(node, allowed_nodes):
+                raise ValueError(
+                    f"flight procedure construct is unavailable: "
+                    f"{type(node).__name__}"
+                )
+            if isinstance(node, ast.Call):
+                if not isinstance(node.func, ast.Name) or node.func.id not in allowed_calls:
+                    raise ValueError("flight procedures may call semantic functions only")
+            if isinstance(node, ast.Name) and node.id.startswith("_"):
+                raise ValueError("private names are unavailable in flight procedures")
+            if isinstance(node, ast.Assign):
+                if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+                    raise ValueError("flight procedures allow simple variable assignment only")
+            if isinstance(node, ast.While) and not any(
+                isinstance(child, ast.Await) for child in ast.walk(node)
+            ):
+                raise ValueError("every flight procedure loop must yield with await")
+        return tree
+
+    async def _takeoff(
+        self,
+        job: ControlJob,
+        state,
+        altitude: float,
+        *,
+        finish: bool,
+    ) -> None:
+        """Make the vehicle airborne; callers never manage arm/mode mechanics."""
+        state = await self._ensure_armed(job, state)
+        state = await self._ensure_navigation_ready(job, state)
+        if not self._airborne(state):
+            await self._update(
+                job,
+                "commanding",
+                f"aircraft ready; initiating takeoff to {altitude:.1f} m",
+            )
+            await self._command_long(
+                job.sysid,
+                "MAV_CMD_NAV_TAKEOFF",
+                0,
+                0,
+                0,
+                math.nan,
+                0,
+                0,
+                altitude,
+                operator_label="takeoff",
+            )
+        await self._update(
+            job,
+            "monitoring",
+            f"takeoff underway; climbing to {altitude:.1f} m",
+        )
+        await self._wait(
+            job.sysid,
+            lambda item: (item.relative_altitude or 0.0) >= altitude * 0.8,
+        )
+        if finish:
+            await self._succeed(
+                job, f"airborne at target band ({altitude:.1f} m requested)"
+            )
+
+    async def _ensure_armed(self, job: ControlJob, state):
+        if self._armed(state):
+            return state
+        await self._update(job, "commanding", "arming aircraft")
+        await self._command_long(
+            job.sysid,
+            "MAV_CMD_COMPONENT_ARM_DISARM",
+            1.0,
+            operator_label="arm",
+        )
+        state = await self._wait(job.sysid, lambda item: self._armed(item))
+        await self._update(job, "commanding", "aircraft armed")
+        return state
+
+    async def _ensure_navigation_ready(self, job: ControlJob, state):
+        """Select whatever autonomous-control state the detected stack needs."""
+        guided_mode = self._guided_mode(state)
+        if guided_mode is None or state.custom_mode == guided_mode:
+            return state
+        await self._update(job, "commanding", "preparing autonomous flight control")
+        await self._command_long(
+            job.sysid,
+            "MAV_CMD_DO_SET_MODE",
+            float(MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
+            float(guided_mode),
+            operator_label="prepare autonomous flight",
+        )
+        return await self._wait(
+            job.sysid,
+            lambda item: item.custom_mode == guided_mode,
+        )
 
     def _resolve_target(self, job: ControlJob, state):
         if GPSposition is None or gps_to_vector is None or vector_to_gps is None:
@@ -391,6 +707,34 @@ class MavlinkControlService:
         raise ValueError(
             "goto requires target marker, latitude/longitude, "
             "or distance_m/bearing_deg"
+        )
+
+    def _resolve_follow_contact(self, target: str):
+        if self.resolve_contact is None:
+            raise RuntimeError("live ATAK contact resolution is unavailable")
+        try:
+            contact = self.resolve_contact(target)
+        except KeyError as exc:
+            raise ValueError(
+                f"live ATAK PLI is unavailable for contact/callsign {target!r}"
+            ) from exc
+        if contact is None:
+            raise ValueError(
+                f"live ATAK PLI is unavailable for contact/callsign {target!r}"
+            )
+        return contact
+
+    @staticmethod
+    def _contact_position(contact):
+        if GPSposition is None or gps_to_vector is None:
+            raise RuntimeError("froggeolib is unavailable")
+        point = getattr(contact, "point", None)
+        if point is None:
+            raise ValueError("live ATAK contact has no PLI position")
+        return GPSposition(
+            float(point.latitude),
+            float(point.longitude),
+            float(getattr(point, "hae", 0.0) or 0.0),
         )
 
     async def _verify_goto(self, job: ControlJob, target, initial: float) -> None:
@@ -438,7 +782,13 @@ class MavlinkControlService:
             await asyncio.sleep(0.5)
         raise TimeoutError("expected telemetry transition was not observed")
 
-    async def _command_long(self, sysid: int, command_name: str, *params) -> None:
+    async def _command_long(
+        self,
+        sysid: int,
+        command_name: str,
+        *params,
+        operator_label: str = "flight command",
+    ) -> None:
         if mavutil is None:
             raise RuntimeError("pymavlink is unavailable")
         command = getattr(mavutil.mavlink, command_name)
@@ -461,7 +811,7 @@ class MavlinkControlService:
 
         async with self._send_lock:
             await asyncio.to_thread(send)
-        await self._wait_ack(sysid, command, sent_at)
+        await self._wait_ack(sysid, command, sent_at, operator_label)
 
     async def _goto(self, sysid: int, lat: float, lon: float, alt: float) -> None:
         if mavutil is None:
@@ -493,9 +843,15 @@ class MavlinkControlService:
 
         async with self._send_lock:
             await asyncio.to_thread(send)
-        await self._wait_ack(sysid, command, sent_at)
+        await self._wait_ack(sysid, command, sent_at, "fly-to")
 
-    async def _wait_ack(self, sysid: int, command: int, sent_at: float) -> None:
+    async def _wait_ack(
+        self,
+        sysid: int,
+        command: int,
+        sent_at: float,
+        operator_label: str,
+    ) -> None:
         deadline = time.monotonic() + min(self.command_timeout, 15.0)
         while time.monotonic() < deadline:
             state = self._require_fresh(sysid)
@@ -505,25 +861,28 @@ class MavlinkControlService:
                 if result in {0, 5}:
                     return
                 raise RuntimeError(
-                    f"vehicle rejected MAVLink command {command} with result {result}"
+                    f"aircraft rejected {operator_label}: "
+                    f"{self._result_name(result)}"
                 )
             await asyncio.sleep(0.1)
-        raise TimeoutError(f"no COMMAND_ACK received for MAVLink command {command}")
+        raise TimeoutError(f"aircraft did not acknowledge {operator_label}")
 
     async def _succeed(self, job: ControlJob, message: str) -> None:
         await self._update(job, "succeeded", message)
 
     async def _update(self, job: ControlJob, phase: str, message: str) -> None:
+        previous_phase = job.phase
         job.phase = phase
         job.message = message
         job.updated_unix = time.time()
-
-    async def _notify_unexpected_failure(self, job: ControlJob) -> None:
-        if job.notify_chat_id:
+        should_notify = phase in TERMINAL_PHASES or (
+            phase == "monitoring" and previous_phase != "monitoring"
+        )
+        if job.notify_chat_id and should_notify:
             try:
                 await self.notify(
                     job.notify_chat_id,
-                    f"{self.callsign(job.sysid)} [{job.id}] failed unexpectedly",
+                    f"{self.callsign(job.sysid)}: {message}",
                 )
             except Exception as exc:
                 logger.warning("MAVLink job %s TAK feedback failed: %s", job.id, exc)
@@ -549,18 +908,37 @@ class MavlinkControlService:
     def _armed(state) -> bool:
         return bool((getattr(state, "base_mode", 0) or 0) & MAV_MODE_FLAG_SAFETY_ARMED)
 
+    @classmethod
+    def _airborne(cls, state) -> bool:
+        return cls._armed(state) and (getattr(state, "relative_altitude", 0.0) or 0.0) > 1.0
+
+    @staticmethod
+    def _result_name(result: int) -> str:
+        if mavutil is not None:
+            entry = getattr(mavutil.mavlink, "enums", {}).get("MAV_RESULT", {}).get(
+                int(result)
+            )
+            if entry is not None:
+                return str(getattr(entry, "name", result)).removeprefix("MAV_RESULT_").lower()
+        return f"result {result}"
+
     @staticmethod
     def _guided_mode(state) -> Optional[int]:
+        return MavlinkControlService._ardupilot_mode(state, "GUIDED")
+
+    @staticmethod
+    def _ardupilot_mode(state, name: str) -> Optional[int]:
         if getattr(state, "autopilot", None) != MAV_AUTOPILOT_ARDUPILOTMEGA:
             return None
         if mavutil is None:
             raise RuntimeError("pymavlink is unavailable")
         mapping = mavutil.mode_mapping_byname(getattr(state, "mav_type", None))
-        if not mapping or "GUIDED" not in mapping:
+        normalized = str(name).upper()
+        if not mapping or normalized not in mapping:
             raise RuntimeError(
-                "ArduPilot vehicle does not advertise a supported GUIDED mode"
+                f"aircraft does not advertise a supported {normalized} flight state"
             )
-        return int(mapping["GUIDED"])
+        return int(mapping[normalized])
 
     @staticmethod
     def _position(state):
