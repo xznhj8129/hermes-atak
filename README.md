@@ -3,7 +3,8 @@
 Hermes ATAK makes the normal Hermes agent act as one virtual ATAK user through
 OpenTAKServer (OTS). It provides direct GeoChat messaging, delivery/read
 receipts, live situational awareness, OTS-retained marker reconciliation, and
-geospatial reasoning through
+an optional persistent multi-vehicle MAVLink telemetry/control service. Geospatial
+reasoning uses
 [frogcot](https://github.com/xznhj8129/frogcot) and
 [froggeolib](https://github.com/xznhj8129/froggeolib).
 
@@ -17,6 +18,12 @@ chatbot, phrase router, polling relay, or alternate persona.
 - A Hermes ATAK platform plugin using a persistent CoT connection.
 - Direct and room GeoChat with delivery and read receipt tracking.
 - Live contacts and markers received from the CoT stream.
+- Stable, continuously updated friendly UAV markers keyed by MAVLink source
+  sysid when the optional router client is enabled.
+- One `mavlink_uav` API for targeted arm, disarm, takeoff, land, RTL, hold, and
+  goto operations without per-command scripts or connections.
+- Immediate command acceptance with a job ID, background telemetry
+  verification, and milestone messages to the originating ATAK chat.
 - On-demand, read-only reconciliation of markers retained by OTS.
 - Range, bearing, elevation, nearest-marker, and relative-marker operations.
 - A Hermes skill that teaches the main agent to interpret spatial language
@@ -37,7 +44,7 @@ python scripts/install.py \
 ```
 
 By default, the installer fetches the versioned frogcot and froggeolib releases
-pinned by this repository.
+and the pinned pymavlink package used by the telemetry bridge.
 
 ### Live development checkouts
 
@@ -60,6 +67,27 @@ skill instruction changes are visible on the next skill load.
 
 The installer can preview its file operations with `--dry-run`. It does not
 modify Hermes configuration, credentials, certificates, or service state.
+
+## Optional persistent MAVLink service
+
+Set `mavlink_enabled: true` in the ATAK platform extras to connect to
+the mavlink-router TCP listener at `tcp:127.0.0.1:5760`. The bridge never binds
+the router's UDP `14550` input. It tracks heartbeat, fix, position, and publish
+cadence independently for each message's actual source sysid, then sends stable
+per-sysid CoT UIDs over the adapter's existing mutual-TLS connection.
+
+The same long-lived routed connection backs `mavlink_uav`. Calls return a job
+ID immediately. The controller rejects stale or ambiguous targets, addresses
+commands to an explicit sysid/component, performs telemetry verification in
+the background, and sends progress directly through the persistent CoT client.
+Marker destinations and relative bearing/distance destinations use FrogCoT
+situational state and FrogGeoLib WGS84 calculations.
+
+The bridge requires both a fresh airborne-vehicle heartbeat and a fresh valid
+3D-fix-backed non-`0,0` location. When either becomes stale, publishing stops
+and the marker's CoT stale timestamp lets ATAK remove it naturally. The feature
+is disabled when `mavlink_enabled` is missing or explicitly false. See
+[references/configuration.md](references/configuration.md) for all defaults.
 
 ## Configure
 
@@ -113,6 +141,7 @@ troubleshooting.
 
 - `SKILL.md` — operational instructions loaded by Hermes.
 - `plugin/` — ATAK platform adapter and OTS snapshot helper.
+- `plugin/mavlink_control.py` — the sole supported UAV command API.
 - `scripts/install.py` — copy/link installer and dependency setup.
 - `references/` — configuration, architecture, and operations details.
 

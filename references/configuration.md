@@ -33,8 +33,9 @@ Hermes skill. Do not edit `~/.hermes/plugins/atak` or
 `~/.hermes/skills/productivity/atak`; those paths point back here.
 
 When checkout paths are omitted, the installer fetches the pinned `frogcot`
-1.2.0 and `froggeolib` 1.1.0 Git tags. To develop the libraries in parallel,
-provide the live worktrees:
+1.2.0 and `froggeolib` 1.1.0 Git tags. It also installs the pinned
+`pymavlink` dependency. To develop the libraries in parallel, provide the live
+worktrees:
 
 ```bash
 python scripts/install.py \
@@ -88,6 +89,17 @@ gateway:
         ots_python: /path/to/opentakserver/python
         ots_config: /path/to/ots/config.yml
         ots_snapshot_ttl: 2.0
+        mavlink_enabled: true
+        mavlink_endpoint: tcp:127.0.0.1:5760
+        mavlink_publish_cadence: 1.0
+        mavlink_freshness: 5.0
+        mavlink_stale: 10.0
+        mavlink_control_timeout: 60.0
+        mavlink_arrival_radius: 10.0
+        mavlink_callsign_prefix: UAV
+        mavlink_callsigns:
+          "1": Survey-UAV
+        mavlink_cot_type: a-f-A-M-F-Q
         position:
           lat: AUTHORIZED_LATITUDE
           lon: AUTHORIZED_LONGITUDE
@@ -103,8 +115,34 @@ ATAK_ALLOWED_USERS=YOUR_ATAK_DEVICE_UID
 ATAK_ALLOW_ALL_USERS=false
 ```
 
+### MAVLink telemetry keys
+
+`mavlink_enabled` is opt-in: a missing value or explicit `false` disables the
+bridge. When enabled, these defaults apply:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `mavlink_endpoint` | `tcp:127.0.0.1:5760` | mavlink-router TCP listener to connect to. UDP and listening endpoints are rejected. |
+| `mavlink_publish_cadence` | `1.0` seconds | Minimum interval between CoT updates, independently per sysid. |
+| `mavlink_freshness` | `5.0` seconds | Maximum age of heartbeat, valid fix, and position required to publish. |
+| `mavlink_stale` | `10.0` seconds | CoT lifetime after each update; values below cadence are raised to cadence. |
+| `mavlink_callsign_prefix` | `UAV` | Default callsign prefix, producing `UAV-1`, `UAV-2`, and so on. |
+| `mavlink_callsigns` | `{}` | Optional string-keyed sysid-to-callsign overrides. |
+| `mavlink_cot_type` | `a-f-A-M-F-Q` | Friendly air UAV CoT type; override for a different known airframe symbol. |
+| `mavlink_reconnect_initial` | `1.0` seconds | Initial router reconnect delay. |
+| `mavlink_reconnect_max` | `30.0` seconds | Maximum router reconnect delay. |
+| `mavlink_control_timeout` | `60.0` seconds | Default telemetry-transition verification timeout. |
+| `mavlink_arrival_radius` | `10.0` metres | Radius within which a goto job is verified as arrived. |
+
+The marker UID is derived as `<stable Hermes uid>-uav-<source sysid>`. Changing
+the Hermes UID therefore changes UAV marker identities. The configured
+callsign map changes labels only, not identities.
+
 For Telegram control, enable the `atak` toolset as shown above and set the
 Telegram home channel through the normal Hermes `/sethome` flow.
+
+`mavlink_uav` is registered in the `atak` toolset. A call originating in ATAK
+captures that conversation automatically for asynchronous job milestones.
 
 ## Activate
 

@@ -1,12 +1,14 @@
 name: atak-platform
 label: ATAK / CoT
 kind: platform
-version: 1.2.2
+version: 1.3.0
 description: >
-  Passive ATAK GeoChat messaging adapter for Hermes. Maintains a persistent
-  mutual-TLS CoT stream, reconciles OpenTAKServer-retained markers on demand,
-  forwards inbound GeoChat to the normal Hermes gateway handler, and sends the
-  final response directly to the originating ATAK peer.
+  ATAK GeoChat messaging adapter for Hermes. Maintains a persistent
+  mutual-TLS CoT stream, optionally publishes fresh multi-system MAVLink UAV
+  locations through that same stream, reconciles OpenTAKServer-retained markers
+  on demand, forwards inbound GeoChat to the normal Hermes gateway handler,
+  sends the final response directly to the originating ATAK peer, and exposes
+  persistent targeted MAVLink UAV control with asynchronous TAK feedback.
 author: Local
 optional_env:
   - name: ATAK_ALLOWED_USERS

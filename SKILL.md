@@ -1,14 +1,14 @@
 ---
 name: hermes-atak
-description: Install, configure, operate, or diagnose the passive Hermes ATAK/OpenTAKServer integration. Use when connecting the normal Hermes main agent to ATAK GeoChat, exposing live and server-retained CoT markers, enabling froggeolib spatial reasoning, resolving ATAK pairing/authorization, or packaging and updating the local ATAK platform plugin.
+description: Install, configure, operate, or diagnose Hermes ATAK/OpenTAKServer, including persistent MAVLink UAV control with live GeoChat feedback.
 ---
 
 # Hermes ATAK
 
-Treat Hermes as one virtual ATAK user. Keep the platform plugin passive: receive
-CoT, translate GeoChat into the normal Hermes gateway message flow, retain
-situational state, and send the main agent's final reply. Never introduce a
-second chatbot, phrase router, polling relay, or alternate persona.
+Treat Hermes as one virtual ATAK user. CoT messaging remains a transport and
+translation layer. UAV control is exposed only through the plugin's persistent
+`mavlink_uav` API. Never introduce a second chatbot, phrase router, polling
+relay, per-command script, or alternate persona.
 
 ## Install
 
@@ -30,6 +30,11 @@ second chatbot, phrase router, polling relay, or alternate persona.
 - Use `send_message` with target `atak` for proactive cross-platform messages.
 - Call `atak_state` for contacts, markers, receipts, nearest objects, relative
   markers, range, bearing, or elevation.
+- Call `mavlink_uav` for UAV status and explicitly requested commands. A
+  command returns a job immediately; background milestones go directly to the
+  originating ATAK chat. Do not wait in an agent loop.
+- Treat UAV identity as the actual MAVLink source sysid. Never infer a vehicle
+  from the local GCS sysid.
 - Interpret spatial language in the model. For “find a marker south of me,” use
   the sender UID as the origin, obtain neutral froggeolib vectors, interpret
   true bearings linguistically, and select the appropriate marker.
@@ -64,6 +69,8 @@ the adapter, identity, marker reconciliation, or spatial calculations.
   integration release that fetches them.
 - Keep `plugin/adapter.py` free of response generation and phrase-specific
   decision rules.
+- Keep one routed pymavlink connection and address every control command to an
+  explicitly discovered sysid/component. Never create per-command processes.
 - Keep OTS database access read-only and on demand.
 - Use stable Hermes and peer UIDs; generate unique event/message IDs.
 - Preserve CA validation and the configured TLS server name.

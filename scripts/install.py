@@ -10,13 +10,21 @@ import subprocess
 from pathlib import Path
 
 
-PLUGIN_FILES = ("__init__.py", "adapter.py", "ots_snapshot.py", "plugin.yaml")
+PLUGIN_FILES = (
+    "__init__.py",
+    "adapter.py",
+    "mavlink_bridge.py",
+    "mavlink_control.py",
+    "ots_snapshot.py",
+    "plugin.yaml",
+)
 FROGCOT_REMOTE = (
     "frogcot @ git+https://github.com/xznhj8129/frogcot.git@v1.2.0"
 )
 FROGGEOLIB_REMOTE = (
     "froggeolib @ git+https://github.com/xznhj8129/froggeolib.git@v1.1.0"
 )
+PYMAVLINK_DEPENDENCY = "pymavlink==2.4.47"
 
 
 def copy_file(source: Path, destination: Path, *, dry_run: bool) -> None:
@@ -120,7 +128,7 @@ def main() -> int:
     if args.gateway_python:
         if not args.uv:
             parser.error("--gateway-python requires uv on PATH or an explicit --uv")
-        dependencies = []
+        dependencies = [PYMAVLINK_DEPENDENCY]
         for name, checkout, remote in (
             ("frogcot", args.frogcot, FROGCOT_REMOTE),
             ("froggeolib", args.froggeolib, FROGGEOLIB_REMOTE),
