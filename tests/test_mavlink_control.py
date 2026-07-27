@@ -24,6 +24,21 @@ def fake_mavutil(monkeypatch):
     fake = SimpleNamespace(mode_mapping_byname=lambda _mav_type: {"GUIDED": 4})
     monkeypatch.setattr(mavlink_control_module, "mavutil", fake)
 
+    class FakeGPS:
+        def __init__(self, lat, lon, hae=0.0):
+            self.lat = lat
+            self.lon = lon
+            self.hae = hae
+
+    def fake_vector(start, target):
+        north_m = (target.lat - start.lat) * 111_000.0
+        east_m = (target.lon - start.lon) * 111_000.0
+        return SimpleNamespace(dist=(north_m**2 + east_m**2) ** 0.5)
+
+    monkeypatch.setattr(mavlink_control_module, "GPSposition", FakeGPS)
+    monkeypatch.setattr(mavlink_control_module, "gps_to_vector", fake_vector)
+    monkeypatch.setattr(mavlink_control_module, "vector_to_gps", lambda *_args, **_kwargs: None)
+
 
 def vehicle_state(**values):
     defaults = {
